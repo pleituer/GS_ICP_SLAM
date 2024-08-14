@@ -20,6 +20,7 @@ Install requirements
 conda create -n gsicpslam python==3.9
 conda activate gsicpslam
 conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia
+conda install nvidia/label/cuda-11.8.0::cuda-toolkit -c nvidia/label/cuda-11.8.0
 pip install -r requirements.txt
 ```
 Also, PCL is needed for fast-gicp submodule.
