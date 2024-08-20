@@ -17,6 +17,7 @@ from utils.traj_utils import TrajManager
 from gaussian_renderer import render, render_2, network_gui
 from tqdm import tqdm
 
+pygicp.set_pcl_verbosity_level(pygicp.L_ERROR)
 
 class Tracker(SLAMParameters):
     def __init__(self, slam):
@@ -93,9 +94,13 @@ class Tracker(SLAMParameters):
         self.final_pose = slam.final_pose
         self.demo = slam.demo
         self.is_mapping_process_started = slam.is_mapping_process_started
+
+        self.timing = {"get pc": 0, "first":0, "gicp":0, "keyframe":0}
     
     def run(self):
+        print("start tracking")
         self.tracking()
+        print("tracking done")
     
     def tracking(self):
         tt = torch.zeros((1,1)).float().cuda()
@@ -114,6 +119,8 @@ class Tracker(SLAMParameters):
         pbar = tqdm(total=self.num_images)
 
         for ii in range(self.num_images):
+            _start = time.perf_counter()
+
             self.iter_shared[0] = ii
             current_image = self.rgb_images.pop(0)
             depth_image = self.depth_images.pop(0)
@@ -121,6 +128,10 @@ class Tracker(SLAMParameters):
                 
             # Make pointcloud
             points, colors, z_values, trackable_filter = self.downsample_and_make_pointcloud2(depth_image, current_image)
+            
+            self.timing["get pc"] += time.perf_counter() - _start
+            _start = time.perf_counter()
+
             # GICP
             if self.iteration_images == 0:
                 current_pose = self.poses[-1]
@@ -187,6 +198,9 @@ class Tracker(SLAMParameters):
                     # rr.set_time_sequence("step", self.iteration_images)
                     rr.set_time_seconds("log_time", time.time() - self.total_start_time)
                     rr.log(f"pt/trackable/{self.iteration_images}", rr.Points3D(points, colors=colors, radii=0.02))
+                
+                torch.cuda.synchronize()
+                self.timing["first"] += time.perf_counter() - _start
             else:
                 self.reg.set_input_source(points)
                 num_trackable_points = trackable_filter.shape[0]
@@ -230,6 +244,10 @@ class Tracker(SLAMParameters):
                 # Use only trackable points when tracking
                 target_corres, distances = self.reg.get_source_correspondence() # get associated points source points
                 
+                torch.cuda.synchronize()
+                self.timing["gicp"] += time.perf_counter() - _start
+                _start = time.perf_counter()
+
                 # Keyframe selection #
                 # Tracking keyframe
                 len_corres = len(np.where(distances<self.overlapped_th)[0]) # 5e-4 self.overlapped_th
@@ -318,6 +336,9 @@ class Tracker(SLAMParameters):
                     self.shared_cam.cam_idx[0] = self.iteration_images
                     
                     self.is_mapping_keyframe_shared[0] = 1
+                    
+                torch.cuda.synchronize()
+                self.timing["keyframe"] += time.perf_counter() - _start
             pbar.update(1)
             
             while 1/((time.time() - self.total_start_time)/(self.iteration_images+1)) > 30.:    #30. float(self.test)
@@ -330,6 +351,15 @@ class Tracker(SLAMParameters):
         self.final_pose[:,:,:] = torch.tensor(self.poses).float()
         self.end_of_dataset[0] = 1
         
+        self.timing["get pc"] /= self.iteration_images
+        self.timing["gicp"] /= (self.iteration_images - 1)
+        self.timing["keyframe"] /= (self.iteration_images - 1)
+
+        print("Tracking (seconds/iteration)")
+        print(f"First iteration (Init): {self.timing['first']:.6f}")
+        print(f"GICP                  : {self.timing['gicp']:.6f}")
+        print(f"Keyframe Selection    : {self.timing['keyframe']:.6f}")
+
         print(f"System FPS: {1/((time.time()-self.total_start_time)/self.num_images):.2f}")
         print(f"ATE RMSE: {self.evaluate_ate(self.trajmanager.gt_poses, self.poses)*100.:.2f}")
 

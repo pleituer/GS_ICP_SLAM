@@ -20,6 +20,8 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import open3d as o3d
 import matplotlib.pyplot as plt
 
+## TODO: time keyframe selection, forward pass, loss computation, backward pass
+
 class Pipe():
     def __init__(self, convert_SHs_python, compute_cov3D_python, debug):
         self.convert_SHs_python = convert_SHs_python
@@ -106,9 +108,13 @@ class Mapper(SLAMParameters):
         self.final_pose = slam.final_pose
         self.demo = slam.demo
         self.is_mapping_process_started = slam.is_mapping_process_started
+
+        self.timing = {"keyframe": 0, "forward":0, "loss":0, "backward":0}
     
     def run(self):
+        print("start mapping")
         self.mapping()
+        print("mapping done")
     
     def mapping(self):
         t = torch.zeros((1,1)).float().cuda()
@@ -156,8 +162,10 @@ class Mapper(SLAMParameters):
                 break
  
             if self.verbose:
-                self.run_viewer()       
-            
+                self.run_viewer()
+
+            _start = time.perf_counter()
+
             if self.is_tracking_keyframe_shared[0]:
                 # get shared gaussians
                 points, colors, rots, scales, z_values, trackable_filter = self.shared_new_gaussians.get_values()
@@ -215,6 +223,9 @@ class Mapper(SLAMParameters):
                     gt_image = viewpoint_cam.rgb_level_2.cuda()
                     gt_depth_image = viewpoint_cam.depth_level_2.cuda()
                 
+                self.timing["keyframe"] += time.perf_counter() - _start
+                _start = time.perf_counter()
+
                 self.training=True
                 render_pkg = render_3(viewpoint_cam, self.gaussians, self.pipe, self.background, training_stage=self.training_stage)
                 
@@ -227,6 +238,10 @@ class Mapper(SLAMParameters):
                 # color_mask = torch.tile(mask, (3,1,1))
                 gt_image = gt_image * mask
                 
+                torch.cuda.synchronize()
+                self.timing["forward"] += time.perf_counter() - _start
+                _start = time.perf_counter()
+
                 # Loss
                 Ll1_map, Ll1 = l1_loss(image, gt_image)
                 L_ssim_map, L_ssim = ssim(image, gt_image)
@@ -238,6 +253,10 @@ class Mapper(SLAMParameters):
                 loss_d = Ll1_d
                 
                 loss = loss_rgb + 0.1*loss_d
+
+                torch.cuda.synchronize()
+                self.timing["loss"] += time.perf_counter() - _start
+                _start = time.perf_counter()
                 
                 loss.backward()
                 with torch.no_grad():
@@ -255,7 +274,10 @@ class Mapper(SLAMParameters):
                         rr.set_time_seconds("log_time", time.time() - self.total_start_time_viewer)
                         rr.log("rendered_rgb", rr.Image(rgb_np))
                         new_keyframe = False
-                        
+                
+                torch.cuda.synchronize()
+                self.timing["backward"] += time.perf_counter() - _start
+                
                 self.training = False
                 self.train_iter += 1
                 # torch.cuda.empty_cache()
@@ -267,6 +289,16 @@ class Mapper(SLAMParameters):
         if self.save_results and not self.rerun_viewer:
             self.gaussians.save_ply(os.path.join(self.output_path, "scene.ply"))
         
+        self.timing["keyframe"] /= self.train_iter
+        self.timing["forward"] /= self.train_iter
+        self.timing["loss"] /= self.train_iter
+        self.timing["backward"] /= self.train_iter
+        
+        print("Mapping (seconds/iteration)")
+        print(f"Keyframe selection: {self.timing['keyframe']:.6f}")
+        print(f"Forward pass      : {self.timing['forward']:.6f}")
+        print(f"Loss Computation  : {self.timing['loss']:.6f}")
+        print(f"Backward pass     : {self.timing['backward']:.6f}")
         self.calc_2d_metric()
     
     def run_viewer(self, lower_speed=True):
